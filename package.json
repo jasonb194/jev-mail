@@ -1,0 +1,7 @@
+{
+  "name": "jev-mail",
+  "private": true,
+  "scripts": {
+    "test": "node --test"
+  }
+}

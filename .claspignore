@@ -1,0 +1,11 @@
+tests/**
+node_modules/**
+coverage/**
+README.md
+package.json
+.gitignore
+.claspignore
+.clasp.json
+*.test.js
+*.spec.js
+*.md
