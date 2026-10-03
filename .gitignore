@@ -1,2 +1,6 @@
 .clasp.json
 .clasprc.json
+node_modules/
+.vercel/
+.env*
+!.env.example

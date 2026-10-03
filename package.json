@@ -1,0 +1,14 @@
+{
+  "name": "jev-mail",
+  "private": true,
+  "scripts": {
+    "test": "node --test",
+    "check": "node tests/check.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "1.1.0"
+  }
+}

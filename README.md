@@ -1,14 +1,19 @@
 # Gmail categorization with Jev
 
-This Google Apps Script checks Gmail on a time trigger and sends eligible threads to a configurable classification API. By default it uses TypeSafe Jev. The project has no web UI; configure it in Apps Script Script Properties.
+Jev is a Google Apps Script that checks Gmail on a configurable schedule and sends eligible threads to a classification API. By default it uses TypeSafe Jev. The owner configures the script through its private web app; settings persist in Script Properties, so routine configuration changes do not require source edits or another code push.
 
 ## Behavior
 
-- The trigger runs every 5 minutes by default. `JEV_ENABLED` defaults to `false`, so setup does not process mail until you turn it on.
-- Each run fetches up to 100 candidate threads and classifies at most 30. Remaining threads are considered on later runs.
-- `JEV_SCOPE=INBOX` selects threads with inbox mail. `JEV_SCOPE=ALL` also searches archived mail. Both modes exclude sent messages, drafts, Spam, and Trash; those messages are omitted even when they are part of an otherwise eligible thread.
-- The configured API provider receives every eligible incoming message in each selected thread, with its sender, subject, and plain-text body. HTML-only bodies are converted to text. Attachments are not sent.
-- The script asks Jev about all nine categories. It applies the category's **display label** when that category's Noul probability is greater than `0.75`. Every successfully classified thread gets the `JEV` label; if no category exceeds the threshold, it gets only `JEV`.
+- The default schedule checks every 5 minutes. Processing is disabled until the owner enables it in the web app.
+- By default, each run fetches up to 100 candidate threads and classifies at most 20. Both limits are configurable in Advanced. Remaining threads are considered on later runs.
+- Threads are packed into JEV requests in search order. The script estimates the complete serialized request at one token per four JSON characters and sends a request as soon as the configured packing target is reached, including the thread that crosses the threshold. The default target is 16,000 tokens. Any nonempty remainder is sent at the end of the run.
+- Each batched request gives every thread a distinct named state entry and a separate question key for each category. Questions explicitly refer to their matching state entry, and the script maps answers back to the local thread list by key before labeling.
+- Packing also respects the configured request and state/question token budgets, which default to 32,000 and 20,000 tokens. If an individual thread exceeds the state/question budget, the script deterministically truncates eligible message bodies, with a clear marker, until the combined thread fits. Sender, subject, message order, and IDs remain intact, and classification uses the retained text. A thread still over the limit after body truncation (for example, because metadata alone is too large) is skipped and remains eligible for a later run.
+- A script lock prevents overlapping batch runs. Gmail API requests are paced according to the Advanced setting, which defaults to one second.
+- Each `runJevBatch` invocation logs Gmail API request-attempt counts by method, published quota-unit costs, estimated Gmail quota units for that invocation, classifier `UrlFetchApp.fetch` attempts, and published per-minute Gmail quota reference limits. Counts include failed calls and provider retry attempts; they do not include hidden transport retries. Unit totals estimate this script's requests only and do not measure other clients or the live project quota. The published limits are references, not guarantees for this Cloud project; Google notes that some projects with Gmail API usage during November 2025 through April 2026 may retain previous quota settings.
+- The **Mailbox scope** setting of `INBOX` selects threads with inbox mail. `ALL` also searches archived mail. Both modes exclude sent messages, drafts, Spam, and Trash; those messages are omitted even when they are part of an otherwise eligible thread.
+- The configured API provider receives every eligible incoming message in each selected thread, with its sender, subject, and plain-text body. HTML-only bodies are converted to text. Oversized threads have their combined eligible message bodies truncated to fit the configured state/question budget (20,000 tokens by default); attachments are not sent.
+- The classifier uses the enabled categories and their configured thresholds. A category applies only when its Noul probability is strictly greater than its threshold. A successfully classified thread gets `JEV` and either the labels for categories that pass or the separate `Jev-Uncategoried` fallback label when no category passes. The fallback is not a classifier category and has no question of its own. Failed or invalid classification results receive no result labels and are left eligible for a later run.
 - The script never archives mail. It adds labels only to eligible incoming messages and does not remove existing labels. Sent messages are never sent to the provider or labeled. Email content is sent for classification and is not stored by this script.
 
 Categories:
@@ -23,9 +28,11 @@ Categories:
 - Jev-Accounts & Security
 - Jev-News & Promotions
 
+`Jev-Uncategoried` is a separate fallback label, not one of the categories above. Category and fallback label changes apply to future processing; the script does not remove previously applied labels.
+
 ## Deploy from a cloned repository with clasp
 
-This is a standalone Apps Script project. [`clasp`](https://developers.google.com/apps-script/guides/clasp) uploads its source to GAS; a one-time editor run grants the script's Gmail permissions and installs its timer. A web app deployment is not needed.
+This is a standalone Apps Script project. [`clasp`](https://developers.google.com/apps-script/guides/clasp) uploads its source to Apps Script. The owner authorizes the script once, then deploys a private web app that runs as that owner. Settings changes made in the web app do not require pushing source code. Code changes still require `clasp push` and an update to the deployed web app version.
 
 ### Prerequisites
 
@@ -38,7 +45,14 @@ This is a standalone Apps Script project. [`clasp`](https://developers.google.co
    clasp login
    ```
 
-4. Clone this repository and open a terminal in the repository root.
+4. Clone this repository and open a terminal in the repository root. You may need repository access if it is private:
+
+   ```sh
+   git clone https://github.com/jasonb194/jev-mail.git
+   cd jev-mail
+   ```
+
+There is no local web server or `npm start` command. Apps Script hosts the running app; this clone is its source and deployment workspace. No `npm install` is needed for the app. `npm test`, if run, is for diagnostics only.
 
 ### Create a script project and push the code
 
@@ -51,18 +65,36 @@ $repoRoot = (Get-Location).Path
 $bootstrapDir = Join-Path $env:TEMP ("jev-mail-clasp-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $bootstrapDir | Out-Null
 Push-Location $bootstrapDir
-clasp create --title "Jev Mail" --type standalone
-Pop-Location
+try {
+  clasp create --title "Jev Mail" --type standalone
+  if ($LASTEXITCODE -ne 0) { throw "clasp create failed." }
+}
+finally { Pop-Location }
 Copy-Item (Join-Path $bootstrapDir ".clasp.json") (Join-Path $repoRoot ".clasp.json")
 clasp show-file-status
+if ($LASTEXITCODE -ne 0) { throw "clasp show-file-status failed." }
 clasp push
 ```
 
-On macOS or Linux, run `clasp create --title "Jev Mail" --type standalone` in a separate empty temporary directory, copy only the generated `.clasp.json` into the repository root, then run `clasp show-file-status` and `clasp push` there. Do not copy the temporary directory's `Code.gs` or `appsscript.json`; this repository's files are the source of truth. `.clasp.json` is per-user and is ignored by Git.
+On macOS or Linux, from the repository root, use a separate temporary directory for project creation and copy only its generated `.clasp.json` back:
+
+```sh
+repo_root="$PWD"
+bootstrap_dir="$(mktemp -d)"
+(
+  cd "$bootstrap_dir" &&
+  clasp create --title "Jev Mail" --type standalone
+) &&
+cp "$bootstrap_dir/.clasp.json" "$repo_root/.clasp.json" &&
+clasp show-file-status &&
+clasp push
+```
+
+Do not copy the temporary directory's `Code.gs` or `appsscript.json`; this repository's files are the source of truth. Review the files shown by `clasp show-file-status` before pushing. If clasp asks whether to overwrite `appsscript.json`, confirm only when the listed local manifest is the one you intend to upload. `.clasp.json` contains this clone's private Apps Script project ID, is per-user, and is ignored by Git; do not commit or share it. The repository does not provide a reusable script ID or API key.
 
 `clasp push` uploads the project source and manifest. The manifest already declares Gmail API v1 and the needed OAuth scopes. If you link the script to a standard Google Cloud project, enable the Gmail API in that Cloud project too.
 
-### Authorize and start the trigger
+### Authorize and deploy the web app
 
 1. From the repository root, open the GAS project:
 
@@ -70,28 +102,68 @@ On macOS or Linux, run `clasp create --title "Jev Mail" --type standalone` in a 
    clasp open-script
    ```
 
-2. In the Apps Script editor, select `initializeJevProperties` and click **Run**. Choose your Google account and approve the requested permissions. This creates the five-minute trigger and seeds missing property defaults; processing stays off because `JEV_ENABLED` defaults to `false`.
-3. Open **Project Settings → Script Properties**. Set `JEV_API_KEY` to your provider's API key, then review `JEV_API_URL`, `JEV_MODEL`, `JEV_SCOPE`, and `JEV_INTERVAL_MINUTES`. Set `JEV_ENABLED` to `true` when ready to begin processing.
+2. In the Apps Script editor, run `initializeJevProperties`. Choose the Google account that owns the mailbox and approve the requested permissions. Initialization preserves existing values and migrates the six legacy settings when present. New installations start paused; an existing `JEV_ENABLED` value is preserved.
+3. In the Apps Script editor, choose **Deploy > New deployment**, select **Web app**, set **Execute as** to **Me** (`USER_DEPLOYING`) and **Who has access** to **Only myself** (`MYSELF`), then deploy. Complete Google's authorization flow and open the deployed web app as the same account. Do not choose an access option that permits other users to open this mailbox settings page.
+4. In **Provider**, enter your API key, endpoint, model, and mailbox scope. The key is stored in the owner's Script Properties and is never returned to the page or included in settings exports. Keep the key out of the repository. Saving a configuration change does not require another source push.
+5. Configure categories, the `Jev-Uncategoried` fallback label, schedule, and advanced settings. The default schedule is every five minutes, all seven days, full day, in `America/New_York`. Save changes, inspect any validation or schedule status, then enable scheduled processing when ready. Initialization installs a timer trigger, but a fresh installation remains paused until processing is enabled; existing setting values are preserved.
 
-The manifest requests Gmail access (`gmail.modify`), permission to manage Apps Script triggers (`script.scriptapp`), and permission to call the configured API (`script.external_request`). Google's [`gmail.modify` scope](https://developers.google.com/workspace/gmail/api/auth/scopes) includes composing and sending mail, but this code only reads messages and applies labels; it does not send or archive mail. The installable trigger runs as the account that created it. For later code updates, run `clasp push` from the repository root. `clasp deploy` is for versioned web apps, add-ons, or API executables and is not required for this time-driven script.
+The manifest requests Gmail access (`gmail.modify`), permission to manage Apps Script triggers (`script.scriptapp`), and permission to call the configured API (`script.external_request`). Google's [`gmail.modify` scope](https://developers.google.com/workspace/gmail/api/auth/scopes) includes composing and sending mail, but this code only reads messages and applies labels; it does not send or archive mail. The installable trigger and web app run as the account that deployed them.
 
-## Script Properties
+To update the running app after changing source, run `clasp push` from the repository root. In Apps Script, choose **Deploy > Manage deployments**, select the active web app, click **Edit**, select or create **New version**, and click **Deploy**. A source push alone does not update the deployed web app. Settings changes saved in the web app need no deployment update. See Google's [deployment guide](https://developers.google.com/apps-script/concepts/deployments) for details.
 
-| Property | Default | Values / purpose |
-| --- | --- | --- |
-| `JEV_API_KEY` | empty | Required API key. Set this before enabling processing. |
-| `JEV_ENABLED` | `false` | `true` enables scheduled processing; `false` pauses it. |
-| `JEV_SCOPE` | `INBOX` | `INBOX` or `ALL`. |
-| `JEV_INTERVAL_MINUTES` | `5` | `1`, `5`, `10`, `15`, or `30`. A changed interval is applied when the trigger next runs. |
-| `JEV_MODEL` | `jev-latest` | Model identifier understood by the configured provider. |
-| `JEV_API_URL` | `https://api.typesafe.ai/v1/systemone` | Complete HTTPS API endpoint, including host and path. |
+## Configure settings in the web app
 
-To use another provider, set `JEV_API_URL` to its full endpoint and update `JEV_MODEL` and `JEV_API_KEY`. The provider must accept the same JSON request and Bearer API-key authentication; provider-specific request or authentication formats are not configurable in this script.
+The web app has five sections:
 
-The trigger remains installed while `JEV_ENABLED` is false, but makes no Gmail search or Jev request. To stop scheduled processing, set it back to `false`.
+- **Dashboard:** processing state, trigger health, active cooldown, recent run summaries, **Run now**, and trigger repair.
+- **Provider:** API key, HTTPS endpoint, model, and `INBOX` or `ALL` scope.
+- **Schedule:** pause/resume, polling interval (1, 5, 10, 15, or 30 minutes), weekdays (Monday through Sunday), active hours, and timezone. Start time is inclusive and end time is exclusive. Equal start and end times mean all day. Overnight windows belong to the weekday on which they start.
+- **Categories:** add, edit, reorder, disable, or remove categories; change labels and descriptions; set the default confidence threshold (0.75 by default) and per-category overrides. Thresholds are between 0 and 1, and a score must be greater than the threshold. The `Jev-Uncategoried` label is configured separately. It applies only after a valid classification when no enabled category passes its threshold.
+- **Advanced:** fetched and classified thread limits, token budgets, provider attempts and retry delay, Gmail pacing, and quota cooldown durations.
+
+The default categories and settings match the project's current defaults. Advanced defaults are 100 fetched threads (range 1–100), 20 classified threads (1–fetch limit), a 16,000-token request packing target (1,000–request budget), 32,000-token request budget (maximum 32,000), 20,000-token state/question budget (maximum 20,000 and no greater than the request budget), three provider attempts (1–5), 1,000 ms initial retry delay (250–5,000 ms), 1,000 ms Gmail spacing (1,000–10,000 ms), and 15/30/60-minute cooldowns (three nondecreasing values from 15–1,440 minutes). The script cooperatively stops starting work after four minutes and reports deferred threads. Limits are enforced before saving.
+
+The settings panel supports API-key keep, replace, and clear actions, plus configuration import and export. Clearing the key requires pausing scheduled processing first. Import previews the replacement before saving; it keeps the API key already configured in the installation. Exports omit API keys and internal runtime state. Saving requires the revision currently loaded in the page. If another tab has saved newer settings, reload before applying the draft. If processing holds the script lock, a save, schedule repair, or manual run reports busy; retry after the run ends. A settings save can succeed while trigger reconciliation is pending; the page reports this as “settings saved; schedule pending” and offers trigger repair.
+
+To use another provider, enter its complete HTTPS endpoint, model, and API key. The provider must accept the same JSON request and Bearer API-key authentication; provider-specific request or authentication formats are not configurable in this script.
+
+**Run now** uses saved settings and bypasses pause and active-hour/day restrictions. It still requires a configured API key and at least one enabled category, and respects the script lock and active quota cooldown. Manual runs do not change the saved schedule. Scheduled runs honor the enabled state, active schedule, key, enabled-category requirement, and cooldown. The dashboard shows trigger health, cooldown, and up to 20 recent run summaries, including outcome and processed/deferred counts.
+
+Configuration is stored in versioned chunks in the owner's Script Properties. On first initialization, legacy values for `JEV_API_KEY`, `JEV_ENABLED`, `JEV_SCOPE`, `JEV_INTERVAL_MINUTES`, `JEV_MODEL`, and `JEV_API_URL` are migrated without resetting them. Thereafter, the web app's saved configuration is authoritative. Avoid editing configuration storage properties directly; use the web app. Trigger IDs and runtime status are maintained separately from user settings.
 
 ## Failures and retries
 
-Configuration, Gmail search, Jev request, and invalid-response failures are logged without logging email content or the API key. The script applies labels to eligible messages in one Gmail batch request after classification succeeds. Failed threads remain unmarked and eligible for a later run. Threads with more than 1,000 eligible messages are skipped before labeling because Gmail's batch-label request limit is 1,000 message IDs; they remain candidates and will be skipped on later runs.
+Configuration, Gmail search, Jev request, and invalid-response failures are logged with bounded diagnostics. For a failed thread, the log includes its thread ID, processing phase (`thread_read`, `classification`, `label_resolution`, or `gmail_labeling`), a bounded safe error category/name and message, a validated numeric HTTP status when available, and a fixed stack-omission marker. HTTP 4xx and 5xx failures also include the provider response body, capped at 2,000 characters. Provider text can include content echoed from the request. The configured API key is redacted when it appears exactly in the body; other reflected content may appear. Raw provider and Gmail exception text and stacks are not emitted. A body decoding failure may also include only allowlisted shape metrics: the eligible message's 1-based position, MIME part path, normalized MIME type, and encoded data length. The script does not directly log request payloads, email body text, encoded body data, headers, or subjects; a provider may echo portions of those values in its response body.
 
-Provider HTTP 429 and 529 responses are retried with exponential delays of 1 and 2 seconds. If the provider continues to rate-limit the request, the script stops the current batch; unattempted threads are deferred to a later trigger.
+To inspect a per-thread failure, open the Apps Script project and select **Executions**, then open the execution that ran at that time and inspect its logs. Per-thread errors are caught so the batch can continue, so the overall execution may be marked completed. Run `npm test` in this repository for local diagnostic coverage; the tests use stubbed Apps Script services and do not contact Gmail or the classification API.
+
+The script validates every expected answer in a JEV response before applying labels to any thread in that request. After validation, it applies each thread's category labels and `JEV` label only to that thread's eligible messages in one Gmail batch request. Failed threads remain unmarked and eligible for a later run. Threads with more than 1,000 eligible messages are skipped before labeling because Gmail's batch-label request limit is 1,000 message IDs; they remain candidates and will be skipped on later runs.
+
+If creating a Gmail label reports a conflict, the script refreshes the label list and reuses the label ID only if the exact requested name is present. A conflict that remains unresolved is treated as a thread failure.
+
+If Gmail reports a recognized quota or rate-limit error, the script stops the current batch without retrying the failed Gmail operation. It persists the configured cooldowns across trigger invocations; the defaults are 15, 30, and 60 minutes. Triggers skip Gmail processing while the cooldown is active. A successful run, including a run with no candidates, clears the cooldown state. Gmail quota is shared with other clients, so pacing and cooldowns cannot guarantee that quota errors never occur.
+
+The run metrics use the Gmail API's published costs: `threads.list` 10 units, `threads.get` 40, `labels.list` 1, `labels.create` 5, and `messages.batchModify` 50. The published per-minute references are 1,200,000 units per project and 6,000 units per user per project. See Google's [Gmail API quota documentation](https://developers.google.com/workspace/gmail/api/reference/quota). The logged per-run totals are estimates for this script's observed API call attempts only; they are not a measurement of total project consumption or a statement of this project's active quota configuration.
+
+Provider HTTP 429 and 529 responses are retried with exponential delays based on the configured initial retry delay (1 second by default). If the provider continues to rate-limit a request, every thread in that request is left unmarked, the run stops, and remaining candidate threads are deferred to a later trigger. Other request or answer-validation failures leave that request's threads unmarked while later batches continue. HTTP 4xx and 5xx logs include the bounded provider response body as described above.
+
+## Deploy the multi-user Vercel app
+
+The Apps Script deployment above remains unchanged. A separate Vercel implementation is available from this repository: it hosts a private settings UI, signs each user in with Google OAuth, and stores per-Google-account settings, encrypted OAuth refresh tokens, encrypted provider keys, and run history in Neon Postgres. Each account authorizes its own Gmail mailbox. The Vercel implementation requests Google's `gmail.modify` scope; Google classifies this as a restricted scope, so a public production OAuth app can require verification and a security assessment. Keep the OAuth app in testing while developing, and review Google's current consent-screen and verification requirements before inviting users.
+
+### Requirements and secrets
+
+- A Vercel project with a Node.js runtime, and a Neon Postgres database.
+- A Google Cloud OAuth 2.0 **Web application** client, with the authorized redirect URI set to `https://YOUR_DEPLOYMENT_HOST/api/auth/callback`; enable Gmail API and configure the consent screen for `openid`, `email`, and `https://www.googleapis.com/auth/gmail.modify`.
+- Set these Vercel environment variables for Production (and Preview only if you have separately configured Google redirect URIs): `APP_URL` (canonical HTTPS deployment origin), `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET`, `DATABASE_URL` (Neon connection string), `SESSION_SECRET` (at least 32 random bytes, preferably 48 or more), `TOKEN_ENCRYPTION_KEY` (exactly 32 random bytes encoded as 64 hex characters), and `CRON_SECRET` (at least 32 random bytes). Variable names are listed in [.env.example](.env.example); it intentionally contains no values. Generate random secrets locally with a trusted password manager or cryptographic random generator; never put their values in source control or paste them into issues.
+
+### Deploy and authorize
+
+1. Import this repository into Vercel and deploy once to obtain the canonical HTTPS host. Add that exact host to `APP_URL` and set Google’s OAuth callback URI to `APP_URL + /api/auth/callback`.
+2. Configure the seven environment variables above, then redeploy. Neon tables are initialized automatically on the first API request; the Google refresh token and provider API key are encrypted at rest with `TOKEN_ENCRYPTION_KEY`.
+3. Open the deployment, choose **Continue with Google**, and authorize Gmail. Add the classification API key in Settings, review the endpoint/model and schedule, then explicitly enable scheduled processing when ready. **Run now** is available independently of the automatic schedule.
+4. Vercel Cron invokes `/api/cron` every minute and the endpoint verifies `CRON_SECRET` using the Authorization bearer token. Vercel Hobby supports at most one cron execution per day, so this cadence requires a paid plan (Pro or higher). Vercel functions on Hobby also have a 300-second maximum duration; Pro duration limits vary by compute configuration. The application honors each account's timezone, active days/hours, and selected interval when it chooses the next eligible run. For plan constraints, check [Vercel Cron pricing and usage](https://vercel.com/docs/cron-jobs/usage-and-pricing) and [function duration limits](https://vercel.com/docs/functions/limitations).
+
+The browser session is an HTTP-only, signed cookie; POST requests additionally validate a CSRF token and same-origin request. Provider keys and refresh tokens are encrypted with AES-256-GCM and never returned to the browser. Database access is scoped by the verified Google subject. Do not enable a public OAuth consent screen until you have completed Google's current restricted-scope verification requirements, and publish an appropriate privacy policy and data-handling disclosures. Email message bodies are sent to the configured classification provider and are not persisted in Neon.
+
+The Vercel version does not use Apps Script properties, triggers, or `clasp`. Install dependencies with `npm ci`, run `npm test` and `npm run check`, and deploy through Vercel. The repository's `.claspignore` keeps these Node/Vercel files out of Apps Script pushes.
